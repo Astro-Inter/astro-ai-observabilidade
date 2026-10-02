@@ -1,0 +1,5 @@
+{
+  "name": "astro-observabilidade-workers-free", "private": true, "type": "module",
+  "scripts": { "check": "tsc --noEmit", "test": "node --test worker.test.ts grafana-logs.test.ts", "deploy": "node assert-free.mjs && wrangler deploy", "dev": "wrangler dev" },
+  "devDependencies": { "wrangler": "4.145.0", "typescript": "5.9.3", "@cloudflare/workers-types": "5.20261001.1" }
+}

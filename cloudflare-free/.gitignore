@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+build/
+parity-input.json
+parity-ts.json
+live-new.json
+live-old.json
