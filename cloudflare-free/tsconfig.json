@@ -1,0 +1,6 @@
+{
+  "compilerOptions": { "target": "ES2022", "module": "ESNext", "moduleResolution": "Bundler", "lib": ["ES2022"],
+    "typeRoots": ["../../tooling/node_modules/@cloudflare"], "types": ["workers-types"], "strict": true,
+    "allowImportingTsExtensions": true, "skipLibCheck": true, "noEmit": true },
+  "include": ["worker.ts", "source.ts", "metrics.ts"]
+}
