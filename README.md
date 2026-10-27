@@ -98,3 +98,7 @@ render.yaml                                    hospedagem da API
 - Transições com o mesmo nome são somadas no trace atual. Assim, a média apresentada é por trace que contém a transição, não por ocorrência individual quando há repetição no mesmo trace.
 - O custo é em USD porque é a moeda retornada pelo LangSmith. Para mostrar ROI em reais, faça conversão explícita com uma cotação definida e identificada antes de preencher o valor da hora.
 - O cache é por instância e não substitui um histórico persistido. A V1 não precisa de banco próprio.
+
+## Diagnóstico operacional
+
+Consulte [os campos e limites dos novos diagnósticos](docs/observability-diagnostics.md) para investigar falhas por requisição ou execução no Grafana.
