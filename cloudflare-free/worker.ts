@@ -1,3 +1,4 @@
+import { diagnostic } from "./diagnostics.ts";
 import { aggregate, dateFormatter, localDate, type Options } from './metrics.ts';
 import { load, ROOT_LIMIT, SourceError, type SourceEnv } from './source.ts';
 import { queueGrafanaLog, type GrafanaEnv } from './grafana-logs.ts';
@@ -61,7 +62,7 @@ export function parseOptions(url: URL, timezone: string, now: Date): Options {
     hourly_cost_usd: numeric('hourly_cost_usd', 6, 0, 10000),
     other_operational_cost_usd: numeric('other_operational_cost_usd', 0, 0, 10000000) };
 }
-export async function handle(request: Request, env: Env, fetcher: typeof fetch = fetch, now = new Date()) {
+export async function handle(request: Request, env: Env, fetcher: typeof fetch = fetch, now = new Date(), requestId = crypto.randomUUID()) {
   const url = new URL(request.url), origin = request.headers.get('Origin');
   const origins = (env.CORS_ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map(s => s.trim().replace(/\/$/, ''));
   const cors = origin && (origins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) ? origin : null;
@@ -101,7 +102,7 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
           cache.set(key, { body, expires: +now + ttl * 1000 });
           response = new Response(body, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
         } catch (error) {
-          console.error(JSON.stringify({ event: 'langsmith_query_failed', code: error instanceof SourceError ? error.code : 'invalid_response',
+          console.error(JSON.stringify({ event: 'langsmith_query_failed', request_id: requestId, ...diagnostic(error), code: error instanceof SourceError ? error.code : 'invalid_response',
             stage: error instanceof SourceError ? error.stage : undefined, status: error instanceof SourceError ? error.status : undefined,
             reason: error instanceof SourceError ? error.reason : undefined }));
           if (error instanceof SourceError && error.status === 429) {
@@ -112,6 +113,7 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
       }
     }
   }
+  response!.headers.set('X-Request-ID', requestId);
   response!.headers.set('Vary', 'Origin');
   response!.headers.set('X-Astro-Trace-Limit', String(ROOT_LIMIT));
   if (cors) response!.headers.set('Access-Control-Allow-Origin', cors);
@@ -121,10 +123,11 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const started = Date.now();
-    const response = await handle(request, env);
+    const requestId = crypto.randomUUID();
+    const response = await handle(request, env, fetch, new Date(), requestId);
     queueGrafanaLog(ctx, env, "astro-ai-observabilidade", "http_request_finished",
       response.status >= 500 ? "ERROR" : "INFO", {
-        method: request.method, route: new URL(request.url).pathname,
+        request_id: requestId, method: request.method, route: ["/health", "/api/observability/dashboard"].includes(new URL(request.url).pathname) ? new URL(request.url).pathname : "unmatched",
         status: response.status, duration_ms: Date.now() - started,
       });
     return response;

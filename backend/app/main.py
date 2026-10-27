@@ -1,3 +1,4 @@
+from app.diagnostics import HttpObservability, diagnostic, emit
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from app.services.metrics import aggregate
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger("astro_observabilidade")
 app = FastAPI(title="Astro Observabilidade", version="1.0.0")
+app.add_middleware(HttpObservability, service="astro-ai-observabilidade")
 app.add_middleware(
     CORSMiddleware, allow_origins=list(settings.allowed_origins),
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
@@ -72,7 +74,7 @@ def dashboard(
             other_operational_cost_usd=other_operational_cost_usd,
         )
     except Exception as error:
-        logger.exception('event=langsmith_query_failed error_type=%s', type(error).__name__)
+        emit('langsmith_query_failed', level='ERROR', dependency='langsmith', stage='load_dashboard', **diagnostic(error))
         raise HTTPException(502, "Não foi possível consultar o LangSmith agora.") from None
     with _cache_lock:
         if len(_cache) > 100:
