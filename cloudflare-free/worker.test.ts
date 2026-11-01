@@ -154,3 +154,28 @@ test('expired data remains visible with its real timestamp during an upstream ra
   assert.equal(body.data_status, 'partial');
   assert.ok(body.warnings.some((w: string) => w.includes('leitura')));
 });
+
+
+test('a cold instance restores a saved sample when LangSmith is rate limited', async () => {
+  const data = await load(env, start, now, fakeSource().fetcher);
+  const stored = { data, start, end: now, generated: now, expires: +now + 300000 };
+  const storage = { match: async () => Response.json(stored), put: async () => {} } as unknown as Cache;
+  const response = await handle(new Request('https://worker.test/api/observability/dashboard?period=7d'),
+    { ...env, LANGSMITH_PROJECT: 'cold-instance' }, (async () => new Response('', {status:429})) as any,
+    new Date(+now + 360000), 'cold-request', storage);
+  const body: any = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.generated_at, now.toISOString());
+  assert.equal(body.executions, 1);
+  assert.ok(body.warnings.some((w: string) => w.includes('leitura')));
+});
+
+test('persisted samples omit trace ids and credentials', async () => {
+  let saved = '';
+  const storage = { match: async () => undefined, put: async (_key: Request, response: Response) => { saved = await response.text(); } } as unknown as Cache;
+  await handle(new Request('https://worker.test/api/observability/dashboard?period=7d'),
+    { ...env, LANGSMITH_PROJECT: 'save-sample' }, fakeSource().fetcher, now, 'save-request', storage);
+  assert.ok(saved.length > 0);
+  assert.ok(!saved.includes('trace-1'));
+  assert.ok(!saved.includes('test-key'));
+});
