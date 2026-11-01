@@ -36,3 +36,10 @@ https://developers.cloudflare.com/containers/platform/pricing/
 ## Grafana
 
 O Worker envia resumos sanitizados das requisições por OTLP/HTTP. GRAFANA_OTLP_ENDPOINT é uma variável e GRAFANA_OTLP_HEADERS fica como Secret. Parâmetros de consulta, dados do LangSmith e credenciais não entram na telemetria; falhas do Grafana não afetam as respostas da API.
+
+
+## Continuidade durante limites do LangSmith
+
+As leituras bem-sucedidas tambem sao guardadas na Cache API do Cloudflare por ate 24 horas, sem credenciais nem identificadores de traces. Uma nova instancia pode recuperar a amostra no mesmo datacenter e recalcular o ROI sem consultar novamente o LangSmith. A data de atualizacao e o intervalo permanecem os da leitura original; dados vencidos sao sinalizados como parciais.
+
+A Cache API pode remover entradas e nao replica dados entre datacenters. Sem uma leitura anterior disponivel, o painel ainda depende de o LangSmith aceitar a consulta. Esse mecanismo reduz interrupcoes e nao elimina os limites do provedor.
