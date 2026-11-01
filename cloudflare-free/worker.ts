@@ -11,7 +11,7 @@ const cooldown = new Map<string, { until: number; error: SourceError }>();
 async function cachedLoad(key: string, env: Env, options: Options, fetcher: typeof fetch, now: Date, ttl: number, snapshotCache?: Cache) {
   // Cache API is private to this Worker; the snapshot route is never served publicly.
   const digest = snapshotCache ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)))).map(n => n.toString(16).padStart(2, '0')).join('') : '';
-  const snapshotKey = new Request(`https://astro-cache.internal/samples/v1/${digest}`);
+  const snapshotKey = new Request(`https://astro-cache.internal/samples/v2/${digest}`);
   let cached = sourceCache.get(key);
   if (!cached && snapshotCache) {
     try {

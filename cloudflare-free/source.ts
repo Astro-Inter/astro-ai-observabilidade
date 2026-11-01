@@ -22,7 +22,10 @@ export function createQueryScheduler(wait = (ms: number) => new Promise<void>(re
 }
 const scheduleQuery = createQueryScheduler();
 
-export const ROOT_LIMIT = 100;
+export const ROOT_LIMIT = 500;
+export function parseRunDate(value: string): Date {
+  return new Date(/(Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : value + "Z");
+}
 const CHILD_LIMIT = 500;
 export function numberMap(raw: unknown): Record<string, number> {
   try {
@@ -64,20 +67,34 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
   const project = await query(`/sessions?limit=1&include_stats=false&name=${encodeURIComponent(env.LANGSMITH_PROJECT || 'astro-ai-api')}`);
   if (!Array.isArray(project) || !project[0]?.id) throw new Error('LangSmith project not found');
   const base = { session: [project[0].id], start_time: start.toISOString(), end_time: end.toISOString(), limit: 100 };
-  const raw = await query('/runs/query', { ...base, is_root: true,
-    filter: `and(eq(name, "astro_chat"), lt(start_time, "${end.toISOString()}"))`,
-    select: ['id', 'trace_id', 'start_time', 'end_time', 'error', 'total_cost', 'extra'] });
-  if (!Array.isArray(raw.runs)) throw new Error('Invalid runs response');
-  const roots: Raw[] = raw.runs.filter((r: Raw) => r.start_time && Date.parse(r.start_time) >= +start && Date.parse(r.start_time) < +end).slice(0, ROOT_LIMIT);
-  const truncated = Boolean(raw.cursors?.next) || raw.runs.length > ROOT_LIMIT;
+  const roots: Raw[] = [];
+  const seen = new Set<string>();
+  let rootCursor: string | undefined;
+  let truncated = false;
+  for (let page = 0; page < ROOT_LIMIT / 100; page++) {
+    const raw = await query('/runs/query', { ...base, is_root: true,
+      filter: `and(eq(name, "astro_chat"), lt(start_time, "${end.toISOString()}"))`,
+      select: ['id', 'trace_id', 'start_time', 'end_time', 'error', 'total_cost', 'extra'],
+      ...(rootCursor ? { cursor: rootCursor } : {}) });
+    if (!Array.isArray(raw.runs)) throw new Error('Invalid runs response');
+    for (const run of raw.runs) {
+      if (!run.start_time || seen.has(run.id)) continue;
+      const started = +parseRunDate(run.start_time);
+      if (roots.length < ROOT_LIMIT && started >= +start && started < +end) { roots.push(run); seen.add(run.id); }
+    }
+    const next = raw.cursors?.next;
+    if (!next || !raw.runs.length) break;
+    if (next === rootCursor || page === ROOT_LIMIT / 100 - 1) { truncated = true; break; }
+    rootCursor = next;
+  }
   const feedback = new Map<string, number>();
   let feedbackPartial = false;
   let rateLimited = false;
   let retryAfter: number | undefined;
   if (roots.length) {
-    for (let offset = 0, page = 0; page < 5; page++, offset += 100) {
-      const params = new URLSearchParams({ key: 'resolved', limit: '100', offset: String(offset) });
-      for (const r of roots) params.append('run', r.id);
+    for (let offset = 0; offset < roots.length; offset += 100) {
+      const params = new URLSearchParams({ key: 'resolved', limit: '100', offset: '0' });
+      for (const r of roots.slice(offset, offset + 100)) params.append('run', r.id);
       let items;
       try { items = await query(`/feedback?${params}`); }
       catch (error) {
@@ -86,8 +103,7 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
       }
       if (!Array.isArray(items)) throw new Error('Invalid feedback response');
       for (const item of items) if (item.run_id && item.score !== null && item.score !== undefined && Number.isFinite(Number(item.score))) feedback.set(item.run_id, Number(Number(item.score) >= .5));
-      if (items.length < 100) break;
-      if (page === 4) feedbackPartial = true;
+      if (items.length >= 100) feedbackPartial = true;
     }
   }
   const metadata = new Map<string, Raw>(roots.map(r => [r.id, r.extra?.metadata ?? {}]));
@@ -131,8 +147,8 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
   }
   const runs: ObservedRun[] = roots.map(r => {
     const m = metadata.get(r.id)!, trace = r.trace_id || r.id;
-    const latency = nonnegative(m.total_response_ms) ?? (r.end_time && Number.isFinite(Date.parse(r.end_time)) ? Math.max(0, Date.parse(r.end_time) - Date.parse(r.start_time)) : null);
-    return { run_id: r.id, started_at: r.start_time, latency_ms: latency, cost_usd: nonnegative(r.total_cost),
+    const latency = nonnegative(m.total_response_ms) ?? (r.end_time && Number.isFinite(+parseRunDate(r.end_time)) ? Math.max(0, +parseRunDate(r.end_time) - +parseRunDate(r.start_time)) : null);
+    return { run_id: r.id, started_at: parseRunDate(r.start_time).toISOString(), latency_ms: latency, cost_usd: nonnegative(r.total_cost) ?? nonnegative(m.observed_cost_usd),
       error: Boolean(r.error || m.error_type), resolved: feedback.get(r.id) ?? null,
       agent_latencies_ms: numberMap(m.agent_latencies_ms), agent_transitions_ms: numberMap(m.agent_transitions_ms),
       agent_costs_usd: costs.get(trace) ?? {}, agent_errors: errors.get(trace) ?? {}, error_stage: m.error_stage ? String(m.error_stage) : null };
