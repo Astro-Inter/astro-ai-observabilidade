@@ -4,31 +4,39 @@ import { load, ROOT_LIMIT, SourceError, type SourceEnv } from './source.ts';
 import { queueGrafanaLog, type GrafanaEnv } from './grafana-logs.ts';
 export interface Env extends SourceEnv, GrafanaEnv { CORS_ALLOWED_ORIGINS?: string; CACHE_TTL_SECONDS?: string; ANALYSIS_TIMEZONE?: string }
 const cache = new Map<string, { expires: number; body: string }>();
-const sourceCache = new Map<string, { expires: number; data: Awaited<ReturnType<typeof load>> }>();
-const inFlight = new Map<string, ReturnType<typeof load>>();
+type Sample = { expires: number; data: Awaited<ReturnType<typeof load>>; start: Date; end: Date; generated: Date };
+const sourceCache = new Map<string, Sample>();
+const inFlight = new Map<string, Promise<Sample & { stale: boolean }>>();
 const cooldown = new Map<string, { until: number; error: SourceError }>();
 async function cachedLoad(key: string, env: Env, options: Options, fetcher: typeof fetch, now: Date, ttl: number) {
   const cached = sourceCache.get(key);
-  if (cached && cached.expires > +now) return cached.data;
+  if (cached && cached.expires > +now) return { ...cached, stale: false };
   const pending = inFlight.get(key);
   if (pending) return pending;
   const integration = JSON.stringify([env.LANGSMITH_PROJECT, env.LANGSMITH_WORKSPACE_ID, env.LANGSMITH_ENDPOINT]);
   const limited = cooldown.get(integration);
-  if (limited && limited.until > +now) throw limited.error;
-  const promise = load(env, options.start, options.end, fetcher);
-  inFlight.set(key, promise);
+  if (limited && limited.until > +now) {
+    if (cached && +now - +cached.generated <= 86400000) return { ...cached, stale: true };
+    throw limited.error;
+  }
+  const promise = (async () => {
   try {
-    const data = await promise;
+    const data = await load(env, options.start, options.end, fetcher);
     if (sourceCache.size >= 16) sourceCache.clear();
-    sourceCache.set(key, { expires: +now + ttl * 1000, data });
-    return data;
+    const entry = { expires: +now + ttl * 1000, data, start: options.start, end: options.end, generated: now };
+    sourceCache.set(key, entry);
+    return { ...entry, stale: false };
   } catch (error) {
     if (error instanceof SourceError && error.status === 429) {
       if (cooldown.size >= 16) cooldown.clear();
       cooldown.set(integration, { until: Date.now() + (error.retryAfter ?? 60) * 1000, error });
     }
+    if (cached && +now - +cached.generated <= 86400000 && error instanceof SourceError && (error.status === 429 || !error.status || error.status >= 500)) return { ...cached, stale: true };
     throw error;
   } finally { inFlight.delete(key); }
+  })();
+  inFlight.set(key, promise);
+  return promise;
 }
 function json(body: unknown, status = 200) { return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json; charset=utf-8' } }); }
 function localMidnight(now: Date, timezone: string) {
@@ -85,21 +93,25 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
       else {
         // Per-isolate cache contains only aggregate results; never raw traces or credentials.
         const sourceKey = JSON.stringify([env.LANGSMITH_PROJECT, env.LANGSMITH_WORKSPACE_ID, env.LANGSMITH_ENDPOINT,
-          options.start.toISOString().slice(0, 16), options.end.toISOString().slice(0, 16)]);
+          options.timezone, url.searchParams.get('period') === 'custom'
+            ? [options.start.toISOString(), options.end.toISOString()]
+            : [url.searchParams.get('period') || '7d', localDate(now, dateFormatter(options.timezone))]]);
         const key = JSON.stringify([sourceKey, options.timezone,
           options.requests_per_user_week, options.minutes_saved_per_resolution, options.hourly_cost_usd, options.other_operational_cost_usd]);
         const cached = cache.get(key);
         if (cached && cached.expires > +now) response = new Response(cached.body, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
         else try {
           const ttl = Math.max(30, Math.min(3600, Number(env.CACHE_TTL_SECONDS) || 300));
-          const data = await cachedLoad(sourceKey, env, options, fetcher, now, ttl);
-          const result = aggregate(data.runs, { ...options, truncated: data.truncated }, now);
+          const sample = await cachedLoad(sourceKey, env, options, fetcher, now, ttl);
+          const data = sample.data;
+          const result = aggregate(data.runs, { ...options, start: sample.start, end: sample.end, truncated: data.truncated }, sample.generated);
+          if (sample.stale) result.warnings.push("Consulta temporariamente indisponível. Exibindo a última leitura disponível; confira a data de atualização.");
           if (data.childPartial) result.warnings.push('O limite gratuito de runs filhos foi atingido; a atribuição por agente pode estar incompleta.');
           if (data.feedbackPartial) result.warnings.push('O limite gratuito de feedback foi atingido; a taxa de resolução usa a amostra consultada.');
           if (result.warnings.length) result.data_status = 'partial';
           const body = JSON.stringify(result);
           if (cache.size >= 100) cache.clear();
-          cache.set(key, { body, expires: +now + ttl * 1000 });
+          cache.set(key, { body, expires: sample.stale ? +now : sample.expires });
           response = new Response(body, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
         } catch (error) {
           console.error(JSON.stringify({ event: 'langsmith_query_failed', request_id: requestId, ...diagnostic(error), code: error instanceof SourceError ? error.code : 'invalid_response',

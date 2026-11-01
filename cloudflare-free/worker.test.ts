@@ -129,3 +129,28 @@ test('zero costs, missing feedback and local-day grouping retain meaningful null
   assert.equal(result.total_cost_usd, 0); assert.equal(result.average_latency_ms, 0); assert.equal(result.roi.roi_percent, null);
   assert.equal(result.resolution_rate, null); assert.equal(result.daily[0].date, '2026-09-19'); assert.equal(result.daily[0].executions, 1);
 });
+
+
+test('cache survives minute boundaries and keeps the original reporting interval', async () => {
+  const project = { ...env, LANGSMITH_PROJECT: 'minute-boundary' }, fake = fakeSource();
+  const request = new Request('https://worker.test/api/observability/dashboard?period=7d');
+  const first = await handle(request, project, fake.fetcher, now);
+  const original: any = await first.json(), calls = fake.calls.length;
+  const second = await handle(request, project, fake.fetcher, new Date(+now + 120000));
+  const reused: any = await second.json();
+  assert.equal(fake.calls.length, calls);
+  assert.deepEqual(reused.period, original.period);
+  assert.equal(reused.generated_at, original.generated_at);
+});
+
+test('expired data remains visible with its real timestamp during an upstream rate limit', async () => {
+  const project = { ...env, LANGSMITH_PROJECT: 'stale-fallback' }, fake = fakeSource();
+  const request = new Request('https://worker.test/api/observability/dashboard?period=7d');
+  const first: any = await (await handle(request, project, fake.fetcher, now)).json();
+  const response = await handle(request, project, (async () => new Response('', {status:429})) as any, new Date(+now + 360000));
+  const body: any = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.generated_at, first.generated_at);
+  assert.equal(body.data_status, 'partial');
+  assert.ok(body.warnings.some((w: string) => w.includes('leitura')));
+});

@@ -150,6 +150,7 @@ function App() {
     try {
       const response = await fetch(`${API_BASE}/api/observability/dashboard?${query}`, { signal })
       if (!response.ok) {
+        if (response.status === 429) throw new Error('O LangSmith atingiu o limite de consultas. Aguarde alguns minutos antes de tentar novamente.')
         if (response.status === 503) throw new Error('A API ainda não tem todas as variáveis necessárias configuradas.')
         throw new Error(response.status === 502 ? 'A consulta ao LangSmith falhou. Tente atualizar em instantes.' : `Não foi possível carregar os dados (${response.status}).`)
       }
