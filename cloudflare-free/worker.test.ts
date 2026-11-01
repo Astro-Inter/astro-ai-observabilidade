@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { aggregate, type ObservedRun } from './metrics.ts';
-import { load, numberMap, createQueryScheduler } from './source.ts';
+import { load, numberMap, parseRunDate, createQueryScheduler } from './source.ts';
 import worker, { handle, parseOptions } from './worker.ts';
 const now = new Date('2026-09-21T04:00:00Z'), start = new Date('2026-09-20T00:00:00Z');
 const root = { id: 'trace-1', trace_id: 'trace-1', start_time: '2026-09-20T01:00:00Z', end_time: '2026-09-20T01:00:02Z',
@@ -45,7 +45,7 @@ test('root sample and child pagination stop at their limits and explicitly repor
 test('feedback pagination is bounded and reports incomplete feedback', async () => {
   const fake = fakeSource({ runs: [root] }, Array.from({ length: 100 }, () => ({ run_id: 'trace-1', score: 1 })));
   const data = await load(env, start, now, fake.fetcher);
-  assert.equal(data.feedbackPartial, true); assert.equal(fake.calls.filter(c => c.url.pathname === '/feedback').length, 5);
+  assert.equal(data.feedbackPartial, true); assert.equal(fake.calls.filter(c => c.url.pathname === '/feedback').length, 1);
 });
 test('invalid or negative metadata is omitted; metadata cannot poison object prototypes', () => {
   assert.deepEqual(numberMap('bad-json'), {}); assert.deepEqual(numberMap([1, 2]), {});
@@ -235,4 +235,31 @@ test('30 days warns about retention while recent periods retain their original w
     assert.equal(response.status, 200);
     assert.equal(body.warnings.some((w: string) => w.includes('14 dias')), period === '30d');
   }
+});
+
+
+test('root pagination includes older days and deduplicates repeated pages', async () => {
+  let pages = 0;
+  const fake = fakeSource();
+  const fetcher = (async (input: any, init: any) => {
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    if (body.is_root) {
+      pages++;
+      return Response.json(pages === 1 ? {runs:[root],cursors:{next:'older'}} : {
+        runs:[root,{...root,id:'older',trace_id:'older',start_time:'2026-09-15T10:00:00',extra:{}}],cursors:{}});
+    }
+    return fake.fetcher(input, init);
+  }) as typeof fetch;
+  const data = await load({...env, LANGSMITH_PROJECT:'root-pagination'}, new Date('2026-09-14T00:00:00Z'), now, fetcher);
+  assert.equal(pages, 2);
+  assert.equal(data.runs.length, 2);
+  assert.equal(data.truncated, false);
+  assert.equal(data.runs[1].started_at, '2026-09-15T10:00:00.000Z');
+});
+
+test('timestamps without timezone are interpreted as UTC; root provider costs are used only when needed', async () => {
+  assert.equal(parseRunDate('2026-11-01T03:00:00').toISOString(), '2026-11-01T03:00:00.000Z');
+  const source = fakeSource({runs:[{...root,total_cost:null,extra:{metadata:{observed_cost_usd:.12}}}]});
+  const data = await load({...env,LANGSMITH_PROJECT:'provider-cost'}, start, now, source.fetcher);
+  assert.equal(data.runs[0].cost_usd, .12);
 });

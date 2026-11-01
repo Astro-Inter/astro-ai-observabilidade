@@ -7,7 +7,7 @@ não são consultados nem enviados ao frontend. A chave LangSmith deve ser confi
 
 ## Limites desta adaptação
 
-- Até 100 traces raiz por consulta, em vez do limite de 5.000 do backend anterior.
+- Até 500 traces raiz por consulta, em vez do limite de 5.000 do backend anterior.
 - Até 500 runs filhos e 500 feedbacks por consulta. Resultados incompletos têm aviso explícito.
 - Até 20 subrequests; timeout de 60 segundos por requisição ao LangSmith, sem retries automáticos.
 - Cache por isolate, por até 300 segundos por padrão, máximo 100 respostas e 16 amostras sanitizadas.
@@ -54,3 +54,6 @@ A Cache API pode remover entradas e nao replica dados entre datacenters. Sem uma
 - A API v2 foi avaliada, mas nao foi adotada: o contrato testado retornou apenas identificadores, insuficientes para as metricas atuais. Uma migracao requer validacao especifica de filtros, projecao de campos e paginacao.
 
 Referencia: https://docs.langchain.com/langsmith/usage-and-billing#run-query-endpoint
+
+
+A leitura raiz pagina ate 500 registros (cinco paginas), com deduplicacao e aviso quando ainda ha cursor. Datas sem sufixo de fuso retornadas pelo LangSmith sao interpretadas como UTC. Consultas de feedback sao divididas por lotes de 100 traces para evitar URLs excessivas. Custo total do LangSmith tem prioridade; na ausencia dele, observed_cost_usd dos metadados raiz e usado quando a API de IA confirmou custo para todas as chamadas do turno. Custos de traces antigos ausentes nao sao reconstruidos. A versao do cache foi atualizada para descartar amostras anteriores a esta correcao.
