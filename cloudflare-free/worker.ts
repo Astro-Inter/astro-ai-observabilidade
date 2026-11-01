@@ -2,7 +2,7 @@ import { diagnostic } from "./diagnostics.ts";
 import { aggregate, dateFormatter, localDate, type Options } from './metrics.ts';
 import { load, ROOT_LIMIT, SourceError, type SourceEnv } from './source.ts';
 import { queueGrafanaLog, type GrafanaEnv } from './grafana-logs.ts';
-export interface Env extends SourceEnv, GrafanaEnv { CORS_ALLOWED_ORIGINS?: string; CACHE_TTL_SECONDS?: string; ANALYSIS_TIMEZONE?: string }
+export interface Env extends SourceEnv, GrafanaEnv { CORS_ALLOWED_ORIGINS?: string; CACHE_TTL_SECONDS?: string; ANALYSIS_TIMEZONE?: string; TRACE_RETENTION_DAYS?: string }
 const cache = new Map<string, { expires: number; body: string }>();
 type Sample = { expires: number; data: Awaited<ReturnType<typeof load>>; start: Date; end: Date; generated: Date };
 const sourceCache = new Map<string, Sample>();
@@ -40,6 +40,7 @@ async function cachedLoad(key: string, env: Env, options: Options, fetcher: type
   try {
     const data = await load(env, options.start, options.end, fetcher);
     if (sourceCache.size >= 16) sourceCache.clear();
+    if (data.rateLimited) cooldown.set(integration, { until: Date.now() + (data.retryAfter ?? 60) * 1000, error: new SourceError('upstream_http', '/runs/query', 429, undefined, data.retryAfter ?? 60) });
     const entry = { expires: +now + ttl * 1000, data, start: options.start, end: options.end, generated: now };
     sourceCache.set(key, entry);
     if (snapshotCache) {
@@ -119,7 +120,7 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
           options.timezone, url.searchParams.get('period') === 'custom'
             ? [options.start.toISOString(), options.end.toISOString()]
             : [url.searchParams.get('period') || '7d', localDate(now, dateFormatter(options.timezone))]]);
-        const key = JSON.stringify([sourceKey, options.timezone,
+        const key = JSON.stringify([sourceKey, options.timezone, env.TRACE_RETENTION_DAYS,
           options.requests_per_user_week, options.minutes_saved_per_resolution, options.hourly_cost_usd, options.other_operational_cost_usd]);
         const cached = cache.get(key);
         if (cached && cached.expires > +now) response = new Response(cached.body, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
@@ -129,8 +130,10 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
           const data = sample.data;
           const result = aggregate(data.runs, { ...options, start: sample.start, end: sample.end, truncated: data.truncated }, sample.generated);
           if (sample.stale) result.warnings.push("Consulta temporariamente indisponível. Exibindo a última leitura disponível; confira a data de atualização.");
-          if (data.childPartial) result.warnings.push('O limite gratuito de runs filhos foi atingido; a atribuição por agente pode estar incompleta.');
-          if (data.feedbackPartial) result.warnings.push('O limite gratuito de feedback foi atingido; a taxa de resolução usa a amostra consultada.');
+          if (data.childPartial) result.warnings.push('A consulta de runs filhos ficou incompleta por limite de uso ou paginação; a atribuição por agente é parcial.');
+          if (data.feedbackPartial) result.warnings.push('A consulta de feedback ficou incompleta por limite de uso ou paginação; a taxa de resolução usa apenas os dados disponíveis.');
+          const retention = Number(env.TRACE_RETENTION_DAYS || 14);
+          if (Number.isFinite(retention) && retention > 0 && +sample.start < +now - retention * 86400000) result.warnings.push(`O período inclui datas anteriores à retenção base configurada de ${retention} dias. O histórico pode estar incompleto; dias sem registros não comprovam ausência de execuções.`);
           if (result.warnings.length) result.data_status = 'partial';
           const body = JSON.stringify(result);
           if (cache.size >= 100) cache.clear();
