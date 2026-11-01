@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { aggregate, type ObservedRun } from './metrics.ts';
-import { load, numberMap } from './source.ts';
+import { load, numberMap, createQueryScheduler } from './source.ts';
 import worker, { handle, parseOptions } from './worker.ts';
 const now = new Date('2026-09-21T04:00:00Z'), start = new Date('2026-09-20T00:00:00Z');
 const root = { id: 'trace-1', trace_id: 'trace-1', start_time: '2026-09-20T01:00:00Z', end_time: '2026-09-20T01:00:02Z',
@@ -153,4 +153,86 @@ test('expired data remains visible with its real timestamp during an upstream ra
   assert.equal(body.generated_at, first.generated_at);
   assert.equal(body.data_status, 'partial');
   assert.ok(body.warnings.some((w: string) => w.includes('leitura')));
+});
+
+
+test('a cold instance restores a saved sample when LangSmith is rate limited', async () => {
+  const data = await load(env, start, now, fakeSource().fetcher);
+  const stored = { data, start, end: now, generated: now, expires: +now + 300000 };
+  const storage = { match: async () => Response.json(stored), put: async () => {} } as unknown as Cache;
+  const response = await handle(new Request('https://worker.test/api/observability/dashboard?period=7d'),
+    { ...env, LANGSMITH_PROJECT: 'cold-instance' }, (async () => new Response('', {status:429})) as any,
+    new Date(+now + 360000), 'cold-request', storage);
+  const body: any = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.generated_at, now.toISOString());
+  assert.equal(body.executions, 1);
+  assert.ok(body.warnings.some((w: string) => w.includes('leitura')));
+});
+
+test('persisted samples omit trace ids and credentials', async () => {
+  let saved = '';
+  const storage = { match: async () => undefined, put: async (_key: Request, response: Response) => { saved = await response.text(); } } as unknown as Cache;
+  await handle(new Request('https://worker.test/api/observability/dashboard?period=7d'),
+    { ...env, LANGSMITH_PROJECT: 'save-sample' }, fakeSource().fetcher, now, 'save-request', storage);
+  assert.ok(saved.length > 0);
+  assert.ok(!saved.includes('trace-1'));
+  assert.ok(!saved.includes('test-key'));
+});
+
+
+test('query scheduler reserves slots for simultaneous requests in the same integration', async () => {
+  const waits: number[] = [];
+  const schedule = createQueryScheduler(async ms => { waits.push(ms); }, () => 1000);
+  await Promise.all([schedule('same', 3500), schedule('same', 3500), schedule('same', 3500), schedule('other', 3500)]);
+  assert.deepEqual(waits, [3500, 7000]);
+});
+
+test('all preset filters send exact start and end boundaries to root and child queries', async () => {
+  const expected: Record<string, string> = { today: '2026-09-21T03:00:00.000Z', '24h': '2026-09-20T04:00:00.000Z', '7d': '2026-09-14T04:00:00.000Z', '30d': '2026-08-22T04:00:00.000Z' };
+  for (const [period, startTime] of Object.entries(expected)) {
+    const fake = fakeSource();
+    const options = parseOptions(new URL('https://test/?period=' + period), 'America/Sao_Paulo', now);
+    await load({ ...env, LANGSMITH_PROJECT: 'boundaries-' + period }, options.start, options.end, fake.fetcher);
+    for (const call of fake.calls.filter(c => c.url.pathname === '/runs/query')) {
+      const body = JSON.parse(String(call.init.body));
+      assert.equal(body.start_time, startTime);
+      assert.equal(body.end_time, now.toISOString());
+    }
+  }
+});
+
+test('rate limited feedback preserves root costs and latency and skips child queries', async () => {
+  const fake = fakeSource();
+  const fetcher = (async (input: any, init: any) => new URL(String(input)).pathname === '/feedback'
+    ? new Response('', { status: 429, headers: { 'Retry-After': '42' } }) : fake.fetcher(input, init)) as typeof fetch;
+  const result = await load({ ...env, LANGSMITH_PROJECT: 'partial-feedback' }, start, now, fetcher);
+  assert.equal(result.runs[0].cost_usd, .25);
+  assert.equal(result.runs[0].latency_ms, 1900);
+  assert.equal(result.runs[0].resolved, null);
+  assert.equal(result.feedbackPartial, true);
+  assert.equal(result.childPartial, true);
+  assert.equal(result.retryAfter, 42);
+  assert.equal(fake.calls.filter(c => c.url.pathname === '/runs/query').length, 1);
+});
+
+test('a child query rate limit does not discard successfully read root metrics', async () => {
+  const fake = fakeSource();
+  const fetcher = (async (input: any, init: any) => init?.body && JSON.parse(String(init.body)).is_root === false
+    ? new Response('', {status:429}) : fake.fetcher(input, init)) as typeof fetch;
+  const result = await load({ ...env, LANGSMITH_PROJECT: 'partial-child' }, start, now, fetcher);
+  assert.equal(result.runs.length, 1);
+  assert.equal(result.runs[0].resolved, 1);
+  assert.equal(result.childPartial, true);
+  assert.equal(result.rateLimited, true);
+});
+
+test('30 days warns about retention while recent periods retain their original warnings', async () => {
+  for (const period of ['today', '24h', '7d', '30d']) {
+    const response = await handle(new Request('https://worker.test/api/observability/dashboard?period='+period),
+      { ...env, LANGSMITH_PROJECT: 'retention-' + period, TRACE_RETENTION_DAYS: '14' }, fakeSource().fetcher, now);
+    const body: any = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.warnings.some((w: string) => w.includes('14 dias')), period === '30d');
+  }
 });

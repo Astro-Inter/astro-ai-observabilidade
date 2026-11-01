@@ -5,6 +5,23 @@ export class SourceError extends Error {
   code: string; stage: string; status?: number; reason?: string; retryAfter?: number;
   constructor(code: string, stage: string, status?: number, reason?: string, retryAfter?: number) { super(code); this.name = 'SourceError'; this.code = code; this.stage = stage; this.status = status; this.reason = reason; this.retryAfter = retryAfter; }
 }
+
+// Reserve query slots per integration in this isolate. Other isolates may still
+// exhaust the workspace limit; the Worker retains Retry-After and cache fallback.
+export function createQueryScheduler(wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)), clock = Date.now) {
+  const slots = new Map<string, number>();
+  return async (key: string, interval: number) => {
+    const now = clock(), at = Math.max(now, slots.get(key) ?? now);
+    if (slots.size >= 64 && !slots.has(key)) {
+      for (const [name, expiry] of slots) if (expiry <= now) slots.delete(name);
+      if (slots.size >= 64) throw new SourceError('query_busy', '/runs/query', 429, undefined, 10);
+    }
+    slots.set(key, at + interval);
+    if (at > now) await wait(at - now);
+  };
+}
+const scheduleQuery = createQueryScheduler();
+
 export const ROOT_LIMIT = 100;
 const CHILD_LIMIT = 500;
 export function numberMap(raw: unknown): Record<string, number> {
@@ -24,9 +41,12 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
   if (endpoint.protocol !== 'https:' || !['api.smith.langchain.com', 'eu.api.smith.langchain.com', 'aws.api.smith.langchain.com'].includes(endpoint.hostname)) throw new Error('Unsupported LangSmith endpoint');
   const headers = new Headers({ 'x-api-key': env.LANGSMITH_API_KEY!, 'Content-Type': 'application/json' });
   if (env.LANGSMITH_WORKSPACE_ID) headers.set('X-Tenant-ID', env.LANGSMITH_WORKSPACE_ID);
+  const integration = JSON.stringify([endpoint.origin, env.LANGSMITH_PROJECT, env.LANGSMITH_WORKSPACE_ID]);
+  const interval = +end - +start > 7 * 86400000 ? 3500 : 1100;
   let requestCount = 0;
   async function query(path: string, body?: Raw): Promise<any> {
     if (++requestCount > 20) throw new Error('Upstream request budget exceeded');
+    if (path === '/runs/query') await scheduleQuery(integration, interval);
     let response: Response;
     try {
       response = await fetcher(`${endpoint.origin}${path}`, { method: body ? 'POST' : 'GET', headers,
@@ -43,7 +63,7 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
   }
   const project = await query(`/sessions?limit=1&include_stats=false&name=${encodeURIComponent(env.LANGSMITH_PROJECT || 'astro-ai-api')}`);
   if (!Array.isArray(project) || !project[0]?.id) throw new Error('LangSmith project not found');
-  const base = { session: [project[0].id], start_time: start.toISOString(), limit: 100 };
+  const base = { session: [project[0].id], start_time: start.toISOString(), end_time: end.toISOString(), limit: 100 };
   const raw = await query('/runs/query', { ...base, is_root: true,
     filter: `and(eq(name, "astro_chat"), lt(start_time, "${end.toISOString()}"))`,
     select: ['id', 'trace_id', 'start_time', 'end_time', 'error', 'total_cost', 'extra'] });
@@ -52,11 +72,18 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
   const truncated = Boolean(raw.cursors?.next) || raw.runs.length > ROOT_LIMIT;
   const feedback = new Map<string, number>();
   let feedbackPartial = false;
+  let rateLimited = false;
+  let retryAfter: number | undefined;
   if (roots.length) {
     for (let offset = 0, page = 0; page < 5; page++, offset += 100) {
       const params = new URLSearchParams({ key: 'resolved', limit: '100', offset: String(offset) });
       for (const r of roots) params.append('run', r.id);
-      const items = await query(`/feedback?${params}`);
+      let items;
+      try { items = await query(`/feedback?${params}`); }
+      catch (error) {
+        if (!(error instanceof SourceError) || error.status !== 429) throw error;
+        feedbackPartial = true; rateLimited = true; retryAfter = error.retryAfter; break;
+      }
       if (!Array.isArray(items)) throw new Error('Invalid feedback response');
       for (const item of items) if (item.run_id && item.score !== null && item.score !== undefined && Number.isFinite(Number(item.score))) feedback.set(item.run_id, Number(Number(item.score) >= .5));
       if (items.length < 100) break;
@@ -67,13 +94,18 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
   const names = new Set(roots.flatMap(r => Object.keys(numberMap(metadata.get(r.id)?.agent_latencies_ms))));
   const traceIds = new Set(roots.map(r => String(r.trace_id || r.id)));
   const children: Raw[] = [];
-  let childPartial = false;
-  if (traceIds.size && names.size) {
+  let childPartial = rateLimited && traceIds.size > 0 && names.size > 0;
+  if (traceIds.size && names.size && !rateLimited) {
     let cursor: string | undefined;
     for (let page = 0; page < CHILD_LIMIT / 100; page++) {
-      const data = await query('/runs/query', { ...base, is_root: false, run_type: 'chain',
+      let data;
+      try { data = await query('/runs/query', { ...base, is_root: false, run_type: 'chain',
         trace_filter: 'eq(name, "astro_chat")', filter: `in(trace_id, ${JSON.stringify([...traceIds])})`,
-        select: ['id', 'trace_id', 'parent_run_id', 'name', 'run_type', 'total_cost', 'error'], ...(cursor ? { cursor } : {}) });
+        select: ['id', 'trace_id', 'parent_run_id', 'name', 'run_type', 'total_cost', 'error'], ...(cursor ? { cursor } : {}) }); }
+      catch (error) {
+        if (!(error instanceof SourceError) || error.status !== 429) throw error;
+        childPartial = true; rateLimited = true; retryAfter = error.retryAfter; break;
+      }
       if (!Array.isArray(data.runs)) throw new Error('Invalid child runs response');
       children.push(...data.runs.filter((c: Raw) => traceIds.has(c.trace_id)));
       cursor = data.cursors?.next;
@@ -105,5 +137,5 @@ export async function load(env: SourceEnv, start: Date, end: Date, fetcher: type
       agent_latencies_ms: numberMap(m.agent_latencies_ms), agent_transitions_ms: numberMap(m.agent_transitions_ms),
       agent_costs_usd: costs.get(trace) ?? {}, agent_errors: errors.get(trace) ?? {}, error_stage: m.error_stage ? String(m.error_stage) : null };
   });
-  return { runs, truncated, childPartial, feedbackPartial };
+  return { runs, truncated, childPartial, feedbackPartial, rateLimited, retryAfter };
 }

@@ -36,3 +36,21 @@ https://developers.cloudflare.com/containers/platform/pricing/
 ## Grafana
 
 O Worker envia resumos sanitizados das requisições por OTLP/HTTP. GRAFANA_OTLP_ENDPOINT é uma variável e GRAFANA_OTLP_HEADERS fica como Secret. Parâmetros de consulta, dados do LangSmith e credenciais não entram na telemetria; falhas do Grafana não afetam as respostas da API.
+
+
+## Continuidade durante limites do LangSmith
+
+As leituras bem-sucedidas tambem sao guardadas na Cache API do Cloudflare por ate 24 horas, sem credenciais nem identificadores de traces. Uma nova instancia pode recuperar a amostra no mesmo datacenter e recalcular o ROI sem consultar novamente o LangSmith. A data de atualizacao e o intervalo permanecem os da leitura original; dados vencidos sao sinalizados como parciais.
+
+A Cache API pode remover entradas e nao replica dados entre datacenters. Sem uma leitura anterior disponivel, o painel ainda depende de o LangSmith aceitar a consulta. Esse mecanismo reduz interrupcoes e nao elimina os limites do provedor.
+
+
+## Filtros e limites de consulta
+
+- Hoje usa meia-noite no fuso configurado; 24h, 7d e 30d usam janelas corridas. As consultas raiz e de agentes enviam start_time e end_time explicitamente.
+- A API v1 permanece em uso. O agendador reserva intervalos de 1,1 segundo para consultas de ate 7 dias e 3,5 segundos para periodos maiores, por integracao na mesma instancia. A concorrencia entre datacenters e outros clientes ainda pode gerar HTTP 429.
+- Um 429 na consulta principal continua respeitando Retry-After e o cache de contingencia. Um 429 em feedback ou runs filhos preserva as metricas raiz ja obtidas e sinaliza os campos complementares como parciais.
+- TRACE_RETENTION_DAYS (14 neste projeto) informa a retencao base observada no LangSmith. Consultas que incluem datas anteriores recebem aviso de historico possivelmente incompleto. A variavel nao muda a retencao nem recupera dados removidos.
+- A API v2 foi avaliada, mas nao foi adotada: o contrato testado retornou apenas identificadores, insuficientes para as metricas atuais. Uma migracao requer validacao especifica de filtros, projecao de campos e paginacao.
+
+Referencia: https://docs.langchain.com/langsmith/usage-and-billing#run-query-endpoint

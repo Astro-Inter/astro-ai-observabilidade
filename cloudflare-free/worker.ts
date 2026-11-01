@@ -2,14 +2,31 @@ import { diagnostic } from "./diagnostics.ts";
 import { aggregate, dateFormatter, localDate, type Options } from './metrics.ts';
 import { load, ROOT_LIMIT, SourceError, type SourceEnv } from './source.ts';
 import { queueGrafanaLog, type GrafanaEnv } from './grafana-logs.ts';
-export interface Env extends SourceEnv, GrafanaEnv { CORS_ALLOWED_ORIGINS?: string; CACHE_TTL_SECONDS?: string; ANALYSIS_TIMEZONE?: string }
+export interface Env extends SourceEnv, GrafanaEnv { CORS_ALLOWED_ORIGINS?: string; CACHE_TTL_SECONDS?: string; ANALYSIS_TIMEZONE?: string; TRACE_RETENTION_DAYS?: string }
 const cache = new Map<string, { expires: number; body: string }>();
 type Sample = { expires: number; data: Awaited<ReturnType<typeof load>>; start: Date; end: Date; generated: Date };
 const sourceCache = new Map<string, Sample>();
 const inFlight = new Map<string, Promise<Sample & { stale: boolean }>>();
 const cooldown = new Map<string, { until: number; error: SourceError }>();
-async function cachedLoad(key: string, env: Env, options: Options, fetcher: typeof fetch, now: Date, ttl: number) {
-  const cached = sourceCache.get(key);
+async function cachedLoad(key: string, env: Env, options: Options, fetcher: typeof fetch, now: Date, ttl: number, snapshotCache?: Cache) {
+  // Cache API is private to this Worker; the snapshot route is never served publicly.
+  const digest = snapshotCache ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)))).map(n => n.toString(16).padStart(2, '0')).join('') : '';
+  const snapshotKey = new Request(`https://astro-cache.internal/samples/v1/${digest}`);
+  let cached = sourceCache.get(key);
+  if (!cached && snapshotCache) {
+    try {
+      const response = await snapshotCache.match(snapshotKey);
+      if (response) {
+        const stored = await response.json() as any;
+        const sample: Sample = { ...stored, start: new Date(stored.start), end: new Date(stored.end), generated: new Date(stored.generated) };
+        if (Array.isArray(sample.data?.runs) && Number.isFinite(+sample.generated) && +sample.generated <= +now && +now - +sample.generated <= 86400000) {
+          cached = sample;
+          if (sourceCache.size >= 16) sourceCache.clear();
+          sourceCache.set(key, sample);
+        }
+      }
+    } catch { /* Cache failure must not block a live query. */ }
+  }
   if (cached && cached.expires > +now) return { ...cached, stale: false };
   const pending = inFlight.get(key);
   if (pending) return pending;
@@ -23,8 +40,15 @@ async function cachedLoad(key: string, env: Env, options: Options, fetcher: type
   try {
     const data = await load(env, options.start, options.end, fetcher);
     if (sourceCache.size >= 16) sourceCache.clear();
+    if (data.rateLimited) cooldown.set(integration, { until: Date.now() + (data.retryAfter ?? 60) * 1000, error: new SourceError('upstream_http', '/runs/query', 429, undefined, data.retryAfter ?? 60) });
     const entry = { expires: +now + ttl * 1000, data, start: options.start, end: options.end, generated: now };
     sourceCache.set(key, entry);
+    if (snapshotCache) {
+      try {
+        const sanitized = { ...entry, data: { ...data, runs: data.runs.map(run => ({ ...run, run_id: '' })) } };
+        await snapshotCache.put(snapshotKey, new Response(JSON.stringify(sanitized), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=86400' } }));
+      } catch { /* Best effort: memory cache and live responses remain usable. */ }
+    }
     return { ...entry, stale: false };
   } catch (error) {
     if (error instanceof SourceError && error.status === 429) {
@@ -70,7 +94,7 @@ export function parseOptions(url: URL, timezone: string, now: Date): Options {
     hourly_cost_usd: numeric('hourly_cost_usd', 6, 0, 10000),
     other_operational_cost_usd: numeric('other_operational_cost_usd', 0, 0, 10000000) };
 }
-export async function handle(request: Request, env: Env, fetcher: typeof fetch = fetch, now = new Date(), requestId = crypto.randomUUID()) {
+export async function handle(request: Request, env: Env, fetcher: typeof fetch = fetch, now = new Date(), requestId = crypto.randomUUID(), snapshotCache?: Cache) {
   const url = new URL(request.url), origin = request.headers.get('Origin');
   const origins = (env.CORS_ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map(s => s.trim().replace(/\/$/, ''));
   const cors = origin && (origins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) ? origin : null;
@@ -96,18 +120,20 @@ export async function handle(request: Request, env: Env, fetcher: typeof fetch =
           options.timezone, url.searchParams.get('period') === 'custom'
             ? [options.start.toISOString(), options.end.toISOString()]
             : [url.searchParams.get('period') || '7d', localDate(now, dateFormatter(options.timezone))]]);
-        const key = JSON.stringify([sourceKey, options.timezone,
+        const key = JSON.stringify([sourceKey, options.timezone, env.TRACE_RETENTION_DAYS,
           options.requests_per_user_week, options.minutes_saved_per_resolution, options.hourly_cost_usd, options.other_operational_cost_usd]);
         const cached = cache.get(key);
         if (cached && cached.expires > +now) response = new Response(cached.body, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
         else try {
           const ttl = Math.max(30, Math.min(3600, Number(env.CACHE_TTL_SECONDS) || 300));
-          const sample = await cachedLoad(sourceKey, env, options, fetcher, now, ttl);
+          const sample = await cachedLoad(sourceKey, env, options, fetcher, now, ttl, snapshotCache);
           const data = sample.data;
           const result = aggregate(data.runs, { ...options, start: sample.start, end: sample.end, truncated: data.truncated }, sample.generated);
           if (sample.stale) result.warnings.push("Consulta temporariamente indisponível. Exibindo a última leitura disponível; confira a data de atualização.");
-          if (data.childPartial) result.warnings.push('O limite gratuito de runs filhos foi atingido; a atribuição por agente pode estar incompleta.');
-          if (data.feedbackPartial) result.warnings.push('O limite gratuito de feedback foi atingido; a taxa de resolução usa a amostra consultada.');
+          if (data.childPartial) result.warnings.push('A consulta de runs filhos ficou incompleta por limite de uso ou paginação; a atribuição por agente é parcial.');
+          if (data.feedbackPartial) result.warnings.push('A consulta de feedback ficou incompleta por limite de uso ou paginação; a taxa de resolução usa apenas os dados disponíveis.');
+          const retention = Number(env.TRACE_RETENTION_DAYS || 14);
+          if (Number.isFinite(retention) && retention > 0 && +sample.start < +now - retention * 86400000) result.warnings.push(`O período inclui datas anteriores à retenção base configurada de ${retention} dias. O histórico pode estar incompleto; dias sem registros não comprovam ausência de execuções.`);
           if (result.warnings.length) result.data_status = 'partial';
           const body = JSON.stringify(result);
           if (cache.size >= 100) cache.clear();
@@ -136,7 +162,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const started = Date.now();
     const requestId = crypto.randomUUID();
-    const response = await handle(request, env, fetch, new Date(), requestId);
+    const response = await handle(request, env, fetch, new Date(), requestId, typeof caches === 'undefined' ? undefined : caches.default);
     queueGrafanaLog(ctx, env, "astro-ai-observabilidade", "http_request_finished",
       response.status >= 500 ? "ERROR" : "INFO", {
         request_id: requestId, method: request.method, route: ["/health", "/api/observability/dashboard"].includes(new URL(request.url).pathname) ? new URL(request.url).pathname : "unmatched",
